@@ -54,17 +54,18 @@ cs599-project/
 ### 1. 进入项目目录
 
 ```cmd
-cd /d D:\codex\code\cs599-project\src\autospider-project
+git clone https://github.com/lingbolan/cs599-project.git
+cd cs599-project\src\autospider-project
 ```
 
 ### 2. 创建虚拟环境
 
 ```cmd
-D:\development\Python\Python311\python.exe -m venv .venv
+py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -U pip
 ```
 
-如果你的 Python 安装路径不同，把第一行改成自己的 `python.exe` 路径即可。
+如果系统没有注册 `py -3.11`，也可以将第一行替换为本机 Python 3.11 的 `python.exe` 路径。
 
 ### 3. 安装依赖
 
@@ -103,7 +104,7 @@ BAILIAN_MODEL=your-model-name
 ### Bangumi 演示任务
 
 ```cmd
-cd /d D:\codex\code\cs599-project\src\autospider-project
+cd cs599-project\src\autospider-project
 start_bangumi_demo.cmd
 ```
 
@@ -142,7 +143,7 @@ Fields: Chinese title, Japanese title, weekday.
 ### 交互式任务
 
 ```cmd
-cd /d D:\codex\code\cs599-project\src\autospider-project
+cd cs599-project\src\autospider-project
 start_autospider.cmd
 ```
 
