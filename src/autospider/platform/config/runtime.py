@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, field_validator
 _DOTENV_LOADED = False
 _CONFIG_CACHE: "Config | None" = None
 REDIS_PIPELINE_MODE = "redis"
+MEMORY_PIPELINE_MODE = "memory"
 PIPELINE_MODE_ONLY_SUPPORTS_REDIS = "pipeline_mode_only_supports_redis"
 
 
@@ -41,9 +42,9 @@ def normalize_pipeline_mode(value: object) -> str:
     normalized = str(value or "").strip().lower()
     if not normalized:
         return REDIS_PIPELINE_MODE
-    if normalized != REDIS_PIPELINE_MODE:
+    if normalized not in {REDIS_PIPELINE_MODE, MEMORY_PIPELINE_MODE}:
         raise ValueError(PIPELINE_MODE_ONLY_SUPPORTS_REDIS)
-    return REDIS_PIPELINE_MODE
+    return normalized
 
 
 class LLMConfig(BaseModel):

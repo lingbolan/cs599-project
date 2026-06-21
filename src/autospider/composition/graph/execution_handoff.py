@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from autospider.platform.config.runtime import config
 from autospider.platform.shared_kernel.grouping_semantics import normalize_grouping_semantics
 from autospider.contexts.collection.domain.fields import FieldDefinition
 from ..pipeline.helpers import resolve_semantic_identity
@@ -106,7 +107,7 @@ def build_chat_review_payload(
                 "field_validate_count",
                 clarified_task.get("field_validate_count"),
             ),
-            "pipeline_mode": cli_args.get("pipeline_mode") or "redis",
+            "pipeline_mode": cli_args.get("pipeline_mode") or config.pipeline.mode,
             "execution_mode": dispatch_mode,
             "headless": cli_args["headless"] if "headless" in cli_args else None,
             "output_dir": str(cli_args.get("output_dir") or "output"),
@@ -172,7 +173,7 @@ def build_chat_execution_params(
                 "field_validate_count",
                 task.get("field_validate_count"),
             ),
-            "pipeline_mode": cli_args.get("pipeline_mode"),
+            "pipeline_mode": cli_args.get("pipeline_mode") or config.pipeline.mode,
             "headless": cli_args["headless"] if "headless" in cli_args else None,
             "output_dir": str(cli_args.get("output_dir") or "output"),
             "serial_mode": cli_args.get("serial_mode"),

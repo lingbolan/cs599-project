@@ -71,6 +71,7 @@ def _resolve_runtime_failure_records(
 
 class PipelineMode(str, Enum):
     REDIS = "redis"
+    MEMORY = "memory"
 
 
 class ResumeMode(str, Enum):

@@ -1,9 +1,11 @@
-"""URL 通道（Channel）工厂模块。"""
+"""URL channel factory."""
 
 from __future__ import annotations
 
 from autospider.platform.config.runtime import config, normalize_pipeline_mode
+
 from .base import URLChannel
+from .memory_channel import MemoryURLChannel
 from .redis_channel import RedisURLChannel
 
 
@@ -12,8 +14,10 @@ def create_url_channel(
     output_dir: str = "output",
     redis_key_prefix: str | None = None,
 ) -> URLChannel:
-    """根据配置或指定模式创建 Redis URL 通道。"""
-    normalize_pipeline_mode(config.pipeline.mode if mode is None else mode)
+    """Create a URL channel according to runtime configuration."""
+    resolved_mode = normalize_pipeline_mode(config.pipeline.mode if mode is None else mode)
+    if resolved_mode == "memory":
+        return MemoryURLChannel()
 
     _ = output_dir
     from autospider.platform.persistence.redis.queue_manager import RedisQueueManager

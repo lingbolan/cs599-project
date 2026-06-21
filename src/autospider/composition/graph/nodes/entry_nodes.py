@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.types import interrupt
 
 from autospider.platform.config.runtime import config
+from autospider.platform.llm.client_factory import build_compatible_default_headers
 from autospider.platform.shared_kernel.grouping_semantics import normalize_grouping_semantics
 from autospider.platform.llm.streaming import ainvoke_with_stream
 from autospider.platform.llm.trace_logger import append_llm_trace
@@ -665,6 +666,7 @@ async def _llm_rank_history(
         temperature=0.0,
         max_tokens=256,
         model_kwargs={"response_format": {"type": "json_object"}},
+        default_headers=build_compatible_default_headers(),
     )
 
     try:

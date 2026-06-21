@@ -59,6 +59,7 @@ CLAUDE.md
 /.agent/
 
 # Playwright
+.pw-browsers/
 playwright-report/
 test-results/
 

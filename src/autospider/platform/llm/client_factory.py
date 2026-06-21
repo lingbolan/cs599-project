@@ -23,6 +23,19 @@ def build_llm_extra_body() -> dict[str, Any]:
     }
 
 
+def build_compatible_default_headers() -> dict[str, str]:
+    """Use neutral headers for OpenAI-compatible gateways with strict WAF rules."""
+    return {
+        "User-Agent": "python-httpx/0.28.1",
+        "X-Stainless-Lang": "",
+        "X-Stainless-Package-Version": "",
+        "X-Stainless-OS": "",
+        "X-Stainless-Arch": "",
+        "X-Stainless-Runtime": "",
+        "X-Stainless-Runtime-Version": "",
+    }
+
+
 def resolve_runtime_llm_config(
     *,
     prefer_planner: bool,
@@ -63,6 +76,7 @@ def build_json_chat_openai(
         max_tokens=max_tokens,
         model_kwargs=build_json_model_kwargs(),
         extra_body=build_llm_extra_body(),
+        default_headers=build_compatible_default_headers(),
     )
 
 
