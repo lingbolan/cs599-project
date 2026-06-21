@@ -1,8 +1,6 @@
 # AutoSpider: A Pure-Vision Browser Agent for Web Data Collection
 
-本仓库为《企业级应用软件设计与开发》课程期末大作业项目。项目选题为 **Agentic AI 原生开发**，基于 AutoSpider 构建一个面向网页数据采集任务的纯视觉浏览器智能体。用户只需要用自然语言描述采集目标，系统会通过 LLM 完成任务澄清、页面规划、浏览器导航、URL 收集、字段抽取和结果落盘。
-
-当前已验证的演示场景为：从 [Bangumi 每日放送日历页](https://bangumi.tv/calendar) 采集动画条目，抽取中文标题、日文标题、放送星期等字段，并输出为 JSONL 结果文件。
+基于 LangGraph 和 Playwright 的纯视觉浏览器智能体，用户用自然语言描述采集目标后，系统自动完成网页导航、URL 收集、字段抽取和结构化结果输出。
 
 ## 方向
 
