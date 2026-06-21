@@ -1,0 +1,88 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and outputs
+logs/
+*.log
+/output/
+/output/benchmark/reports/
+/tests/benchmark/reports/
+/src/output/
+screenshots/
+scripts/_generated/
+
+.pytest_tmp*/
+.tmp_pytest*/
+.pytest_tmp_run*/
+/.tmp/
+/tmp/
+/docs/
+CLAUDE.md
+/skills/
+/.agent/
+
+# Playwright
+.pw-browsers/
+playwright-report/
+test-results/
+
+# Environment variables
+.env.local
+.env.production
+
+# Private and IDE config
+.auth/
+.trae/
+.codex/
+.task_tracker/
+.task_trash/
+/artifacts/
+.claude/
+.agents/
+test_tab_click.py
+
+# AI editing folders
+manual_*/
+tmp_*/
+agent-*/
+.claude/worktrees/
+/.mypy*/
+/refactor/
+/frontend/

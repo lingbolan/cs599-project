@@ -1,0 +1,786 @@
+"""详情页 URL 在线收集器：LLM 样本采集 -> 规则生成 -> 规则验证 -> 规则执行。"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+
+from autospider.platform.config.runtime import config
+from autospider.platform.observability.logger import get_logger
+from autospider.platform.browser.som import (
+    capture_screenshot_with_marks,
+    clear_overlay,
+    inject_and_scan,
+)
+from autospider.platform.persistence.files.idempotent_io import (
+    write_json_idempotent,
+    write_text_if_changed,
+)
+from autospider.platform.shared_kernel.knowledge_contracts import build_list_profile_key
+from autospider.contexts.collection.application.use_cases.explore_site import (
+    build_detail_visit,
+    extract_mark_id_text_map,
+    prepare_explore_skill_context,
+    resolve_selected_mark_ids,
+)
+from autospider.contexts.collection.infrastructure.repositories.config_repository import (
+    CollectionConfig,
+)
+from autospider.contexts.collection.infrastructure.crawler.base.base_collector import BaseCollector
+from autospider.contexts.collection.infrastructure.crawler.collector import (
+    CommonPattern,
+    DetailPageVisit,
+    LLMDecisionMaker,
+    NavigationHandler,
+    URLCollectorResult,
+    smart_scroll,
+)
+from .explore_dependencies import (
+    CollectionExploreDependencies,
+    SkillRuntimeLike,
+    build_collection_explore_dependencies,
+)
+
+if TYPE_CHECKING:
+    from playwright.async_api import Page
+
+    from autospider.contexts.collection.infrastructure.channel.base import URLChannel
+    from autospider.platform.shared_kernel.types import SoMSnapshot
+
+
+logger = get_logger(__name__)
+URL_RULE_MIN_PRECISION = 0.8
+URL_RULE_MIN_RECALL = 0.8
+URL_RULE_MIN_SAMPLE = 3
+PROFILE_STATUS_VALIDATED = "validated"
+PROFILE_STATUS_REJECTED = "rejected"
+PROFILE_STATUS_MISS = "miss"
+
+
+class URLCollector(BaseCollector):
+    """单链路 URL 收集器。"""
+
+    def __init__(
+        self,
+        page: "Page",
+        list_url: str,
+        task_description: str,
+        execution_brief: dict | None = None,
+        explore_count: int = 3,
+        max_nav_steps: int = 10,
+        target_url_count: int | None = None,
+        max_pages: int | None = None,
+        output_dir: str = "output",
+        url_channel: "URLChannel | None" = None,
+        persist_progress: bool = True,
+        skill_runtime: SkillRuntimeLike | None = None,
+        selected_skills_context: str = "",
+        selected_skills: list[dict] | None = None,
+        initial_nav_steps: list[dict] | None = None,
+        initial_collection_config: CollectionConfig | dict | list[dict] | None = None,
+        anchor_url: str = "",
+        page_state_signature: str = "",
+        variant_label: str = "",
+        decision_context: dict | None = None,
+        explore_dependencies: CollectionExploreDependencies | None = None,
+    ):
+        super().__init__(
+            page=page,
+            list_url=list_url,
+            task_description=task_description,
+            execution_brief=execution_brief,
+            output_dir=output_dir,
+            url_channel=url_channel,
+            target_url_count=target_url_count,
+            max_pages=max_pages,
+            persist_progress=persist_progress,
+        )
+
+        self.explore_count = explore_count
+        self.max_nav_steps = max_nav_steps
+        resolved_dependencies = explore_dependencies or build_collection_explore_dependencies(
+            output_dir=output_dir,
+            skill_runtime=skill_runtime,
+        )
+        if resolved_dependencies.script_generator is None:
+            raise ValueError("collection_explore_dependencies_missing_script_generator")
+        self.skill_runtime = resolved_dependencies.skill_runtime
+        self.selected_skills_context = str(selected_skills_context or "")
+        self.selected_skills = list(selected_skills or [])
+        self.initial_nav_steps = list(initial_nav_steps or [])
+        self.initial_collection_config_candidates: list[CollectionConfig] = []
+        if isinstance(initial_collection_config, list):
+            self.initial_collection_config_candidates = [
+                CollectionConfig.from_mapping(item)
+                for item in initial_collection_config
+                if isinstance(item, dict) and item
+            ]
+            self.initial_collection_config = (
+                self.initial_collection_config_candidates[0]
+                if self.initial_collection_config_candidates
+                else None
+            )
+        elif isinstance(initial_collection_config, dict) and initial_collection_config:
+            self.initial_collection_config = CollectionConfig.from_mapping(initial_collection_config)
+            self.initial_collection_config_candidates = [self.initial_collection_config]
+        else:
+            self.initial_collection_config = initial_collection_config or None
+            if self.initial_collection_config:
+                self.initial_collection_config_candidates = [self.initial_collection_config]
+        self.decision_context = dict(decision_context or {})
+        self.anchor_url = str(anchor_url or "")
+        self.page_state_signature = str(page_state_signature or "")
+        self.variant_label = str(variant_label or "")
+        self.profile_key = build_list_profile_key(
+            page_state_signature=self.page_state_signature,
+            anchor_url=self.anchor_url,
+            variant_label=self.variant_label,
+            task_description=task_description,
+        )
+        self.profile_validation_status = PROFILE_STATUS_MISS
+        self.profile_reject_reason = "missing_key"
+
+        self.detail_visits: list[DetailPageVisit] = []
+        self.step_index = 0
+        self.visited_detail_urls: set[str] = set()
+        self.common_pattern: CommonPattern | None = None
+
+        self.decider = resolved_dependencies.decider
+        self.script_generator = resolved_dependencies.script_generator
+        self.config_persistence = resolved_dependencies.config_persistence
+        self.xpath_extractor = resolved_dependencies.xpath_extractor
+
+    def _log_run_start(self) -> None:
+        initial_config = self.initial_collection_config
+        config_type = type(initial_config).__name__ if initial_config is not None else "None"
+        logger.info(
+            "[URLCollector] start: task=%s | list=%s | target=%s | sample=%s | max_pages=%s | initial_config=%s | nav_steps=%s | profile_key=%s",
+            self.task_description,
+            self.list_url,
+            self.target_url_count if self.target_url_count is not None else "<none>",
+            self.explore_count,
+            self.max_pages if self.max_pages is not None else "<none>",
+            config_type,
+            len(self.initial_nav_steps or []),
+            self.profile_key or "<empty>",
+        )
+
+    def _log_page_summary(self, *, new_urls: list[str], new_visits: list[DetailPageVisit]) -> None:
+        logger.info(
+            "[URLCollector] page=%s summary: mode=%s | new_urls=%s | total_urls=%s | new_visits=%s | detail_visits=%s | xpath=%s",
+            self.pagination_handler.current_page_num,
+            "xpath" if self.common_detail_xpath else "llm",
+            len(new_urls),
+            len(self.collected_urls),
+            len(new_visits),
+            len(self.detail_visits),
+            str(self.common_detail_xpath or "") or "<empty>",
+        )
+
+    def _log_stop(self, reason: str) -> None:
+        logger.info(
+            "[URLCollector] stop: reason=%s | total_urls=%s | detail_visits=%s | xpath=%s | profile=%s | reject=%s",
+            reason,
+            len(self.collected_urls),
+            len(self.detail_visits),
+            str(self.common_detail_xpath or "") or "<empty>",
+            self.profile_validation_status or "<empty>",
+            self.profile_reject_reason or "<empty>",
+        )
+
+    def _log_run_end(self) -> None:
+        logger.info(
+            "[URLCollector] completed: urls=%s | detail_visits=%s | xpath=%s | profile=%s | reject=%s",
+            len(self.collected_urls),
+            len(self.detail_visits),
+            str(self.common_detail_xpath or "") or "<empty>",
+            self.profile_validation_status or "<empty>",
+            self.profile_reject_reason or "<empty>",
+        )
+
+    async def run(self) -> URLCollectorResult:
+        self._log_run_start()
+        await self._prepare_skill_context()
+
+        await self.page.goto(self.list_url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(1)
+        self._initialize_handlers()
+
+        if await self._try_apply_initial_collection_config():
+            logger.info(
+                "[URLCollector] profile=hit: validated list profile | xpath=%s | pagination=%s | jump=%s",
+                str(self.common_detail_xpath or "") or "<empty>",
+                str(getattr(self.pagination_handler, "pagination_xpath", "") or "") or "<empty>",
+                "yes" if getattr(self.pagination_handler, "jump_widget_xpath", None) else "no",
+            )
+        else:
+            logger.info("[URLCollector] profile=miss: fallback=llm_sample")
+            await self._run_navigation_phase()
+
+        self._sync_navigation_page()
+
+        validation_pages = max(1, int(config.field_extractor.validate_count))
+
+        while not self.common_detail_xpath and self.pagination_handler.current_page_num <= self.max_pages:
+            logger.info(
+                "[URLCollector] page=%s collect_start: urls=%s | detail_visits=%s | target=%s",
+                self.pagination_handler.current_page_num,
+                len(self.collected_urls),
+                len(self.detail_visits),
+                self.target_url_count if self.target_url_count is not None else "<none>",
+            )
+
+            page_urls, new_visits = await self._collect_current_page_with_llm()
+            self._log_page_summary(new_urls=page_urls, new_visits=new_visits)
+
+            self.save_running_progress()
+
+            if len(self.collected_urls) >= self.target_url_count:
+                self._log_stop("target_url_count_reached")
+                break
+
+            if len(self.detail_visits) >= self.explore_count and not self.common_detail_xpath:
+                logger.info(
+                    "[URLCollector] xpath_build: visits=%s | sample_target=%s",
+                    len(self.detail_visits),
+                    self.explore_count,
+                )
+                candidate_xpath = self.xpath_extractor.extract_common_xpath(self.detail_visits)
+                if candidate_xpath:
+                    self.common_detail_xpath = candidate_xpath
+                    self.common_pattern = CommonPattern(
+                        xpath_pattern=candidate_xpath,
+                        confidence=0.8,
+                        source_visits=self.detail_visits,
+                    )
+
+                    logger.info("\n[Phase 4] validate_rule: 使用后续页面验证公共详情 XPath")
+                    validated = await self._validate_xpath_rule_on_next_pages(validation_pages)
+                    if validated:
+                        logger.info(
+                            "[URLCollector] xpath_validated: xpath=%s",
+                            self.common_detail_xpath,
+                        )
+                        pagination_xpath = await self.pagination_handler.extract_pagination_xpath()
+                        if pagination_xpath:
+                            logger.info(
+                                "[URLCollector] pagination_xpath=%s",
+                                pagination_xpath,
+                            )
+                        jump_widget_xpath = (
+                            await self.pagination_handler.extract_jump_widget_xpath()
+                        )
+                        if jump_widget_xpath:
+                            logger.info("[URLCollector] jump_widget=enabled")
+                        self._save_config()
+                        break
+
+                    logger.info("[URLCollector] 公共详情 XPath 验证失败，继续手动采集样本")
+                    self.common_detail_xpath = None
+                    self.common_pattern = None
+
+            if not await self._advance_to_next_page():
+                self._log_stop("no_next_page")
+                break
+
+        if self.common_detail_xpath and len(self.collected_urls) < self.target_url_count:
+            logger.info(
+                "[URLCollector] rule_run: xpath=%s | remaining=%s",
+                self.common_detail_xpath,
+                self.target_url_count - len(self.collected_urls),
+            )
+            await self._collect_phase_with_xpath()
+
+        crawler_script = await self._generate_crawler_script()
+        result = self._create_result()
+        await self._save_result(result, crawler_script)
+        self._log_run_end()
+        self.save_progress_status(status="COMPLETED")
+        return result
+
+    def _initialize_handlers(self) -> None:
+        self.llm_decision_maker = LLMDecisionMaker(
+            page=self.page,
+            decider=self.decider,
+            task_description=self.task_description,
+            collected_urls=self.collected_urls,
+            visited_detail_urls=self.visited_detail_urls,
+            list_url=self.list_url,
+            selected_skills_context=self.selected_skills_context,
+            selected_skills=self.selected_skills,
+            execution_brief=self.execution_brief,
+            decision_context=self.decision_context,
+        )
+        super()._initialize_handlers()
+        self.navigation_handler = NavigationHandler(
+            page=self.page,
+            list_url=self.list_url,
+            task_description=self.task_description,
+            max_nav_steps=self.max_nav_steps,
+            decider=self.decider,
+            execution_brief=self.execution_brief,
+            decision_context=self.decision_context,
+            screenshots_dir=self.screenshots_dir,
+        )
+
+    async def _run_navigation_phase(self) -> None:
+        if self.initial_nav_steps:
+            logger.info("\n[Phase 1] 重放 planner 导航路径...")
+            await self._replay_initial_nav_steps()
+            return
+        logger.info("\n[Phase 1] 导航阶段：根据任务描述进行筛选操作...")
+        nav_success = await self.navigation_handler.run_navigation_phase()
+        if not nav_success:
+            logger.info("[URLCollector] 导航阶段未完全完成，将在当前页面继续采集")
+        self.nav_steps = self.navigation_handler.nav_steps
+
+    async def _replay_initial_nav_steps(self) -> None:
+        nav_success = await self.navigation_handler.replay_nav_steps(self.initial_nav_steps)
+        replay_succeeded = bool(getattr(nav_success, "success", nav_success))
+        if replay_succeeded:
+            self.nav_steps = list(self.initial_nav_steps)
+            logger.info("[URLCollector] ✓ planner 导航路径重放完成，共 %s 步", len(self.nav_steps))
+            return
+        failure_reason = str(getattr(nav_success, "failure_reason", "") or "").strip()
+        if failure_reason:
+            raise RuntimeError(f"planner_nav_steps_replay_failed:{failure_reason}")
+        raise RuntimeError("planner_nav_steps_replay_failed")
+
+    def _sync_navigation_page(self) -> None:
+        if self.navigation_handler and self.navigation_handler.page is not self.page:
+            new_page = self.navigation_handler.page
+            new_list_url = self.navigation_handler.list_url or new_page.url
+            self._sync_page_references(new_page, list_url=new_list_url)
+
+    async def _prepare_skill_context(self) -> None:
+        loaded_skills = []
+        (
+            self.selected_skills,
+            self.selected_skills_context,
+            loaded_skills,
+        ) = await prepare_explore_skill_context(
+            skill_runtime=self.skill_runtime,
+            phase="url_collector",
+            url=self.list_url,
+            task_context={
+                "task_description": self.task_description,
+                "target_url_count": self.target_url_count,
+            },
+            llm=self.decider.llm,
+            preselected_skills=self.selected_skills,
+        )
+
+    async def _try_apply_initial_collection_config(self) -> bool:
+        candidates = list(self.initial_collection_config_candidates)
+        if not candidates and self.initial_collection_config:
+            candidates = [self.initial_collection_config]
+        logger.info(
+            "[URLCollector] profile_candidate_check: profile_key=%s, candidates=%s, initial_config_type=%s, anchor_url=%s, page_state_signature=%s, variant_label=%s",
+            str(self.profile_key or "") or "<empty>",
+            len(candidates),
+            type(self.initial_collection_config).__name__ if self.initial_collection_config is not None else "None",
+            str(self.anchor_url or "") or "<empty>",
+            str(self.page_state_signature or "") or "<empty>",
+            str(self.variant_label or "") or "<empty>",
+        )
+        if not candidates:
+            logger.info(
+                "[URLCollector] profile_candidate_miss: reason=no_initial_collection_config, task_description=%s, list_url=%s",
+                self.task_description,
+                self.list_url,
+            )
+            self._mark_profile_rejected("missing_key")
+            return False
+        for candidate in candidates:
+            if await self._try_validate_initial_collection_candidate(candidate):
+                self.initial_collection_config = candidate
+                return True
+        return False
+
+    async def _try_validate_initial_collection_candidate(self, candidate: CollectionConfig) -> bool:
+        detail_xpath = str(candidate.common_detail_xpath or "").strip()
+        previous_detail_xpath = str(self.common_detail_xpath or "").strip()
+        previous_nav_steps = [dict(step) for step in getattr(self, "nav_steps", [])]
+        logger.info(
+            "[URLCollector] profile_validate_start: candidate_profile_key=%s, previous_xpath=%s, candidate_xpath=%s, previous_nav_steps=%s, candidate_nav_steps=%s",
+            str(candidate.profile_key or ""),
+            previous_detail_xpath or "<empty>",
+            detail_xpath or "<empty>",
+            len(previous_nav_steps),
+            len(candidate.nav_steps),
+        )
+        if not detail_xpath:
+            self._mark_profile_rejected("missing_common_detail_xpath")
+            return False
+        previous_detail_xpath_value = self.common_detail_xpath
+        if candidate.nav_steps:
+            replay = await self.navigation_handler.replay_nav_steps(candidate.nav_steps)
+            replay_succeeded = bool(getattr(replay, "success", replay))
+            if not replay_succeeded:
+                reason = str(getattr(replay, "failure_reason", "") or "replay_failed")
+                self._mark_profile_rejected(f"nav_replay_failed:{reason}")
+                return False
+            self.nav_steps = [dict(step) for step in candidate.nav_steps]
+        self.common_detail_xpath = detail_xpath
+        preview_urls = await self._preview_urls_with_xpath()
+        logger.info(
+            "[URLCollector] profile_validate_preview: candidate_profile_key=%s, applied_xpath=%s, preview_urls=%s, preview_sample=%s",
+            str(candidate.profile_key or ""),
+            detail_xpath,
+            len(preview_urls),
+            preview_urls[:5],
+        )
+        if not preview_urls:
+            self.nav_steps = previous_nav_steps
+            self.common_detail_xpath = previous_detail_xpath_value
+            logger.info(
+                "[URLCollector] profile_validate_restore: restore_xpath=%s, restore_nav_steps=%s, reject_reason=xpath_no_match",
+                previous_detail_xpath or "<empty>",
+                len(previous_nav_steps),
+            )
+            self._mark_profile_rejected("xpath_no_match")
+            return False
+        self._apply_initial_pagination_config(candidate)
+        self.profile_validation_status = PROFILE_STATUS_VALIDATED
+        self.profile_reject_reason = ""
+        logger.info(
+            "[URLCollector] profile_hit: preview_urls=%s, candidate_profile_key=%s",
+            len(preview_urls),
+            str(candidate.profile_key or ""),
+        )
+        return True
+
+    def _mark_profile_rejected(self, reason: str) -> None:
+        self.profile_validation_status = PROFILE_STATUS_REJECTED
+        self.profile_reject_reason = str(reason or "profile_rejected")
+        logger.info(
+            "[URLCollector] profile_reject: reason=%s, current_xpath=%s, profile_key=%s",
+            self.profile_reject_reason,
+            str(self.common_detail_xpath or "") or "<empty>",
+            str(self.profile_key or "") or "<empty>",
+        )
+
+    def _apply_initial_pagination_config(self, candidate: CollectionConfig) -> None:
+        if not self.pagination_handler:
+            return
+        if candidate.pagination_xpath:
+            self.pagination_handler.pagination_xpath = candidate.pagination_xpath
+        if candidate.jump_widget_xpath:
+            self.pagination_handler.jump_widget_xpath = dict(candidate.jump_widget_xpath)
+
+    async def _collect_current_page_with_llm(self) -> tuple[list[str], list[DetailPageVisit]]:
+        if not self.llm_decision_maker:
+            return [], []
+
+        target_url_count = self.target_url_count
+        max_scrolls = config.url_collector.max_scrolls
+        no_new_threshold = config.url_collector.no_new_url_threshold
+        page_urls: list[str] = []
+        page_visits: list[DetailPageVisit] = []
+        scroll_count = 0
+        no_new_urls_count = 0
+        last_url_count = len(self.collected_urls)
+
+        while scroll_count < max_scrolls and no_new_urls_count < no_new_threshold:
+            if len(self.collected_urls) >= target_url_count:
+                break
+
+            await clear_overlay(self.page)
+            snapshot = await inject_and_scan(self.page)
+            _, screenshot_base64 = await capture_screenshot_with_marks(self.page)
+            llm_decision = await self.llm_decision_maker.ask_for_decision(
+                snapshot, screenshot_base64
+            )
+
+            if llm_decision and llm_decision.get("action") == "select":
+                args = (
+                    llm_decision.get("args") if isinstance(llm_decision.get("args"), dict) else {}
+                )
+                purpose = (args.get("purpose") or "").lower()
+                if purpose in {"detail_links", "detail_link", "detail"}:
+                    page_urls_delta, visits_delta = await self._collect_selected_detail_links(
+                        llm_decision=llm_decision,
+                        snapshot=snapshot,
+                    )
+                    page_urls.extend(page_urls_delta)
+                    page_visits.extend(visits_delta)
+
+            current_count = len(self.collected_urls)
+            if current_count == last_url_count:
+                no_new_urls_count += 1
+            else:
+                no_new_urls_count = 0
+                last_url_count = current_count
+
+            if len(self.collected_urls) >= target_url_count:
+                break
+            if not await smart_scroll(self.page):
+                break
+            scroll_count += 1
+
+        return page_urls, page_visits
+
+    async def _collect_selected_detail_links(
+        self,
+        *,
+        llm_decision: dict,
+        snapshot: "SoMSnapshot",
+    ) -> tuple[list[str], list[DetailPageVisit]]:
+        args = llm_decision.get("args") if isinstance(llm_decision.get("args"), dict) else {}
+        items = args.get("items") or []
+        mark_id_text_map = extract_mark_id_text_map(items) or args.get("mark_id_text_map", {}) or {}
+        fallback_mark_ids = args.get("mark_ids", [])
+        mark_ids = await resolve_selected_mark_ids(
+            page=self.page,
+            llm=self.decider.llm,
+            snapshot=snapshot,
+            mark_id_text_map=mark_id_text_map,
+            fallback_mark_ids=fallback_mark_ids,
+        )
+
+        if not mark_ids:
+            return [], []
+
+        page_urls: list[str] = []
+        page_visits: list[DetailPageVisit] = []
+        candidates = [mark for mark in snapshot.marks if mark.mark_id in mark_ids]
+        for candidate in candidates:
+            if len(self.collected_urls) >= self.target_url_count:
+                break
+
+            url = await self.url_extractor.extract_from_element(
+                candidate,
+                snapshot,
+                nav_steps=self.nav_steps,
+            )
+            if not url:
+                continue
+
+            if url not in self.collected_urls:
+                if await self.remember_collected_url(url):
+                    page_urls.append(url)
+
+            if url in self.visited_detail_urls:
+                continue
+
+            visit = build_detail_visit(
+                list_url=self.list_url,
+                detail_url=url,
+                step_index=self.step_index,
+                element=candidate,
+            )
+            self.step_index += 1
+            self.detail_visits.append(visit)
+            self.visited_detail_urls.add(url)
+            page_visits.append(visit)
+
+        return page_urls, page_visits
+
+    async def _preview_urls_with_xpath(self) -> list[str]:
+        if not self.common_detail_xpath:
+            return []
+
+        preview_urls: list[str] = []
+        locators = self.page.locator(f"xpath={self.common_detail_xpath}")
+        count = await locators.count()
+        for index in range(count):
+            locator = locators.nth(index)
+            if self.url_extractor:
+                url = await self.url_extractor.extract_from_locator(locator, self.nav_steps)
+                if url:
+                    preview_urls.append(url)
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for url in preview_urls:
+            value = str(url or "").strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    async def _validate_xpath_rule_on_next_pages(self, validation_pages: int) -> bool:
+        for page_index in range(validation_pages):
+            llm_urls, _ = await self._collect_current_page_with_llm()
+            xpath_urls = await self._preview_urls_with_xpath()
+            llm_set = self._normalize_url_set(llm_urls)
+            xpath_set = self._normalize_url_set(xpath_urls)
+            if len(llm_set) < URL_RULE_MIN_SAMPLE:
+                logger.info(
+                    "[URLCollector] XPath 验证样本不足: page=%s, sample=%s, reason=insufficient_validation_sample",
+                    page_index + 1,
+                    len(llm_set),
+                )
+                return False
+            precision, recall = self._measure_url_rule_quality(llm_set=llm_set, xpath_set=xpath_set)
+            if precision < URL_RULE_MIN_PRECISION or recall < URL_RULE_MIN_RECALL:
+                logger.info(
+                    "[URLCollector] 验证失败: page=%s, llm=%s, xpath=%s, precision=%.3f, recall=%.3f",
+                    page_index + 1,
+                    len(llm_set),
+                    len(xpath_set),
+                    precision,
+                    recall,
+                )
+                return False
+
+            self.save_running_progress()
+            if page_index == validation_pages - 1:
+                break
+            if not await self._advance_to_next_page():
+                return False
+
+        return True
+
+    def _normalize_url_set(self, urls: list[str]) -> set[str]:
+        normalized: set[str] = set()
+        for raw in urls:
+            value = str(raw or "").strip()
+            if value:
+                normalized.add(value)
+        return normalized
+
+    def _measure_url_rule_quality(
+        self, *, llm_set: set[str], xpath_set: set[str]
+    ) -> tuple[float, float]:
+        if not llm_set or not xpath_set:
+            return 0.0, 0.0
+        overlap = len(llm_set & xpath_set)
+        precision = overlap / len(xpath_set) if xpath_set else 0.0
+        recall = overlap / len(llm_set) if llm_set else 0.0
+        return precision, recall
+
+    async def _advance_to_next_page(self) -> bool:
+        delay = self.rate_controller.get_delay()
+        await asyncio.sleep(delay)
+        return await self.pagination_handler.find_and_click_next_page()
+
+    def _save_config(self) -> None:
+        collection_config = CollectionConfig(
+            profile_key=self.profile_key,
+            nav_steps=self.nav_steps,
+            common_detail_xpath=self.common_detail_xpath,
+            pagination_xpath=(
+                self.pagination_handler.pagination_xpath if self.pagination_handler else None
+            ),
+            jump_widget_xpath=(
+                self.pagination_handler.jump_widget_xpath if self.pagination_handler else None
+            ),
+            list_url=self.list_url,
+            anchor_url=self.anchor_url,
+            page_state_signature=self.page_state_signature,
+            variant_label=self.variant_label,
+            task_description=self.task_description,
+            profile_validation_status=self.profile_validation_status,
+            profile_reject_reason=self.profile_reject_reason,
+        )
+        self.config_persistence.save(collection_config)
+        logger.info("[URLCollector] 配置已持久化")
+
+    async def _generate_crawler_script(self) -> str:
+        detail_visits_dict = [
+            {
+                "detail_page_url": visit.detail_page_url,
+                "clicked_element_tag": visit.clicked_element_tag,
+                "clicked_element_text": visit.clicked_element_text,
+                "clicked_element_href": visit.clicked_element_href,
+                "clicked_element_role": visit.clicked_element_role,
+                "clicked_element_xpath_candidates": visit.clicked_element_xpath_candidates,
+            }
+            for visit in self.detail_visits
+        ]
+
+        return await self.script_generator.generate_scrapy_playwright_script(
+            list_url=self.list_url,
+            task_description=self.task_description,
+            detail_visits=detail_visits_dict,
+            nav_steps=self.nav_steps,
+            collected_urls=self.collected_urls,
+            common_detail_xpath=self.common_detail_xpath,
+        )
+
+    def _create_result(self) -> URLCollectorResult:
+        return URLCollectorResult(
+            detail_visits=self.detail_visits,
+            common_pattern=self.common_pattern,
+            collected_urls=self.collected_urls,
+            list_page_url=self.list_url,
+            task_description=self.task_description,
+            created_at="",
+        )
+
+    async def _save_result(self, result: URLCollectorResult, crawler_script: str = "") -> None:
+        output_file = self.output_dir / "collected_urls.json"
+        data = {
+            "list_page_url": result.list_page_url,
+            "task_description": result.task_description,
+            "collected_urls": result.collected_urls,
+            "nav_steps": self.nav_steps,
+            "detail_visits": [
+                {
+                    "list_page_url": visit.list_page_url,
+                    "detail_page_url": visit.detail_page_url,
+                    "clicked_element_tag": visit.clicked_element_tag,
+                    "clicked_element_text": visit.clicked_element_text,
+                    "clicked_element_href": visit.clicked_element_href,
+                    "clicked_element_role": visit.clicked_element_role,
+                    "clicked_element_xpath_candidates": visit.clicked_element_xpath_candidates,
+                }
+                for visit in result.detail_visits
+            ],
+            "created_at": result.created_at,
+        }
+
+        persisted = write_json_idempotent(
+            output_file,
+            data,
+            identity_keys=("list_page_url", "task_description"),
+        )
+        result.created_at = str((persisted or data).get("created_at") or result.created_at)
+        logger.info(f"[Save] 结果已保存到: {output_file}")
+
+        self.url_publish_service.write_snapshot(result.collected_urls)
+
+        if crawler_script:
+            script_file = self.output_dir / "spider.py"
+            write_text_if_changed(script_file, crawler_script)
+            logger.info(f"[Save] Scrapy 爬虫脚本已保存到: {script_file}")
+
+
+async def collect_detail_urls(
+    page: "Page",
+    list_url: str,
+    task_description: str,
+    explore_count: int = 3,
+    target_url_count: int | None = None,
+    max_pages: int | None = None,
+    output_dir: str = "output",
+    persist_progress: bool = True,
+    skill_runtime: SkillRuntimeLike | None = None,
+    selected_skills: list[dict] | None = None,
+    initial_collection_config: CollectionConfig | dict | None = None,
+    anchor_url: str = "",
+    page_state_signature: str = "",
+    variant_label: str = "",
+    explore_dependencies: CollectionExploreDependencies | None = None,
+) -> URLCollectorResult:
+    collector = URLCollector(
+        page=page,
+        list_url=list_url,
+        task_description=task_description,
+        explore_count=explore_count,
+        target_url_count=target_url_count,
+        max_pages=max_pages,
+        output_dir=output_dir,
+        persist_progress=persist_progress,
+        skill_runtime=skill_runtime,
+        selected_skills=selected_skills,
+        initial_collection_config=initial_collection_config,
+        anchor_url=anchor_url,
+        page_state_signature=page_state_signature,
+        variant_label=variant_label,
+        explore_dependencies=explore_dependencies,
+    )
+    return await collector.run()
+

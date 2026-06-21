@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import importlib
+import json
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+
+pytestmark = pytest.mark.smoke
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+
+def _reload_trace_module():
+    config_module = importlib.import_module("autospider.platform.config.runtime")
+    trace_logger = importlib.import_module("autospider.platform.llm.trace_logger")
+
+    config_module.get_config(reload=True)
+    return importlib.reload(trace_logger)
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(line) for line in lines]
+
+
+@pytest.fixture()
+def repo_tmp_dir() -> Path:
+    base_dir = REPO_ROOT / "artifacts" / "test_tmp"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    path = base_dir / f"trace-tests-{uuid4().hex[:8]}"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_append_llm_trace_appends_jsonl_records(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_tmp_dir: Path,
+) -> None:
+    trace_path = repo_tmp_dir / "llm-trace.jsonl"
+    monkeypatch.setenv("LLM_TRACE_ENABLED", "true")
+    monkeypatch.setenv("LLM_TRACE_FILE", str(trace_path))
+    trace_logger = _reload_trace_module()
+
+    trace_logger.append_llm_trace(
+        "planner",
+        {"model": "gpt-test", "input": "first", "output": "one", "response_summary": "alpha"},
+    )
+    trace_logger.append_llm_trace(
+        "planner",
+        {"model": "gpt-test", "input": "second", "output": "two", "response_summary": "beta"},
+    )
+
+    records = _read_jsonl(trace_path)
+    assert len(records) == 2
+    assert records[0]["input"] == "first"
+    assert records[0]["output"] == "one"
+    assert records[1]["input"] == "second"
+    assert records[1]["response_summary"] == "beta"
+
+
+def test_append_llm_trace_writes_real_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_tmp_dir: Path,
+) -> None:
+    trace_path = repo_tmp_dir / "llm-trace-timestamp.jsonl"
+    monkeypatch.setenv("LLM_TRACE_ENABLED", "true")
+    monkeypatch.setenv("LLM_TRACE_FILE", str(trace_path))
+    trace_logger = _reload_trace_module()
+
+    trace_logger.append_llm_trace(
+        "collector",
+        {"model": "gpt-test", "input": "ping", "output": "pong", "response_summary": "ok"},
+    )
+
+    record = _read_jsonl(trace_path)[0]
+    timestamp = str(record["timestamp"])
+    assert timestamp
+    datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
+def test_append_llm_trace_resolves_relative_paths_from_repo_root(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_tmp_dir: Path,
+) -> None:
+    relative_path = Path("output/__pytest__") / f"trace-{uuid4().hex}.jsonl"
+    repo_target = (REPO_ROOT / relative_path).resolve()
+    cwd_target = (repo_tmp_dir / relative_path).resolve()
+    monkeypatch.chdir(repo_tmp_dir)
+    monkeypatch.setenv("LLM_TRACE_ENABLED", "true")
+    monkeypatch.setenv("LLM_TRACE_FILE", str(relative_path))
+    trace_logger = _reload_trace_module()
+
+    try:
+        trace_logger.append_llm_trace(
+            "field",
+            {"model": "gpt-test", "input": "a", "output": "b", "response_summary": "c"},
+        )
+        assert repo_target.exists()
+        assert not cwd_target.exists()
+    finally:
+        repo_target.unlink(missing_ok=True)
+        cwd_target.unlink(missing_ok=True)
+
+
+def test_append_llm_trace_includes_run_and_trace_context(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_tmp_dir: Path,
+) -> None:
+    from autospider.platform.shared_kernel.trace import clear_run_context, set_run_context
+
+    trace_path = repo_tmp_dir / "llm-trace-context.jsonl"
+    monkeypatch.setenv("LLM_TRACE_ENABLED", "true")
+    monkeypatch.setenv("LLM_TRACE_FILE", str(trace_path))
+    trace_logger = _reload_trace_module()
+
+    set_run_context(run_id="run-123", trace_id="trace-456")
+    try:
+        trace_logger.append_llm_trace(
+            "collector",
+            {"model": "gpt-test", "input": "ping", "output": "pong", "response_summary": "ok"},
+        )
+    finally:
+        clear_run_context()
+
+    record = _read_jsonl(trace_path)[0]
+    assert record["run_id"] == "run-123"
+    assert record["trace_id"] == "trace-456"
+
+
+def test_summarize_llm_payload_includes_token_usage() -> None:
+    from autospider.platform.llm.protocol import summarize_llm_payload
+
+    class _FakePayload:
+        usage_metadata = {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}
+        response_metadata = {"token_usage": {"prompt_tokens": 11, "completion_tokens": 7}}
+        content = "ok"
+
+    summary = summarize_llm_payload(_FakePayload())
+
+    assert summary["token_usage"] == {
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+    }
+
+
+def test_collect_trace_stats_aggregates_token_usage_by_run_id(repo_tmp_dir: Path) -> None:
+    from autospider.platform.llm.trace_stats import collect_trace_stats
+
+    trace_path = repo_tmp_dir / "llm-trace-stats.jsonl"
+    trace_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "run_id": "run-a",
+                        "trace_id": "run-a",
+                        "response_summary": {
+                            "token_usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 5,
+                                "total_tokens": 15,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-a",
+                        "trace_id": "run-a",
+                        "response_summary": {
+                            "token_usage": {
+                                "prompt_tokens": 20,
+                                "completion_tokens": 8,
+                                "total_tokens": 28,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "run_id": "run-b",
+                        "trace_id": "run-b",
+                        "response_summary": {
+                            "token_usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "total_tokens": 2,
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stats = collect_trace_stats(run_id="run-a", trace_file=str(trace_path))
+
+    assert stats.llm_calls == 2
+    assert stats.calls_with_token_usage == 2
+    assert stats.prompt_tokens == 30
+    assert stats.completion_tokens == 13
+    assert stats.total_tokens == 43
+    assert stats.token_usage_available is True

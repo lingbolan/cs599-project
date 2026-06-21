@@ -1,0 +1,103 @@
+[importlinter]
+root_package = autospider
+include_external_packages = True
+
+# ==================== 契约 1：分层架构 ====================
+[importlinter:contract:layers]
+name = Layered architecture
+type = layers
+layers =
+    autospider.interface
+    autospider.composition
+    autospider.contexts
+    autospider.platform
+ignore_imports =
+    autospider.contexts.collection.application.use_cases.finalize_run -> autospider.composition.pipeline.aggregator
+    autospider.contexts.collection.application.use_cases.finalize_run -> autospider.composition.pipeline.finalization
+    autospider.contexts.collection.application.use_cases.navigate -> autospider.composition.graph.recovery
+    autospider.contexts.collection.application.use_cases.run_subtask -> autospider.composition.pipeline.worker
+    autospider.contexts.planning.application.handlers -> autospider.composition.pipeline.types
+
+# ==================== 契约 2：Domain 层纯净 ====================
+[importlinter:contract:domain-pure-planning]
+name = Planning domain is pure
+type = forbidden
+source_modules =
+    autospider.contexts.planning.domain
+forbidden_modules =
+    langgraph
+    playwright
+    redis
+    sqlalchemy
+    openai
+    loguru
+    langchain
+    requests
+    httpx
+
+[importlinter:contract:domain-pure-collection]
+name = Collection domain is pure
+type = forbidden
+source_modules =
+    autospider.contexts.collection.domain
+forbidden_modules =
+    langgraph
+    playwright
+    redis
+    sqlalchemy
+    openai
+    loguru
+    langchain
+    requests
+    httpx
+
+[importlinter:contract:domain-pure-experience]
+name = Experience domain is pure
+type = forbidden
+source_modules =
+    autospider.contexts.experience.domain
+forbidden_modules =
+    langgraph
+    playwright
+    redis
+    sqlalchemy
+    openai
+    loguru
+    langchain
+
+[importlinter:contract:domain-pure-chat]
+name = Chat domain is pure
+type = forbidden
+source_modules =
+    autospider.contexts.chat.domain
+forbidden_modules =
+    langgraph
+    playwright
+    redis
+    sqlalchemy
+    openai
+    loguru
+    langchain
+
+# ==================== 契约 3：可立即执行的 Application 约束 ====================
+[importlinter:contract:chat-app-no-infra]
+name = Chat application does not import infrastructure
+type = forbidden
+source_modules =
+    autospider.contexts.chat.application
+forbidden_modules =
+    autospider.contexts.chat.infrastructure
+
+[importlinter:contract:experience-app-no-infra]
+name = Experience application does not import infrastructure
+type = forbidden
+source_modules =
+    autospider.contexts.experience.application
+forbidden_modules =
+    autospider.contexts.experience.infrastructure
+
+# ==================== Direct-only 边界说明 ====================
+# 跨 context 的 facade-only 约束，以及 interface 不直接 import contexts，
+# 由 tests/contracts/test_context_boundary_freeze.py 的 AST 合同测试冻结。
+# import-linter 的 forbidden 合同会把经 facade 的传递依赖也判为违规，
+# 不适合表达这种“只限制直接导入”的边界。

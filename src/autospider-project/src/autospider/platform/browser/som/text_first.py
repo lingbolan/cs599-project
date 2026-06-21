@@ -1,0 +1,340 @@
+"""
+文本优先的 mark_id 解析/消歧工具
+
+修改原因：
+- 项目内多个模块都会让视觉 LLM 返回 mark_id（有时还会返回该元素文本）。
+- 视觉模型最常见的错误是：文本选对了，但 mark_id 读错；或同一文本在页面多处出现导致歧义。
+- 为提升鲁棒性，全项目统一使用“文本优先、歧义重选、未命中报错”的策略。
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from autospider.platform.config.runtime import config
+from autospider.platform.observability.logger import get_logger
+from autospider.platform.llm.streaming import ainvoke_with_stream
+from autospider.platform.llm.trace_logger import append_llm_trace
+from autospider.platform.llm.protocol import (
+    extract_response_text_from_llm_payload,
+    parse_protocol_message,
+    summarize_llm_payload,
+)
+from autospider.platform.shared_kernel.utils.prompt_template import render_template
+from autospider.platform.shared_kernel.utils.paths import get_prompt_path
+from autospider.platform.browser.visual_decision_cache import VisualDecisionCache
+from .mark_id_validator import MarkIdValidator
+from .api import capture_screenshot_with_custom_marks
+
+if TYPE_CHECKING:
+    from langchain_openai import ChatOpenAI
+    from playwright.async_api import Page
+    from autospider.platform.shared_kernel.types import ElementMark, SoMSnapshot
+
+
+PROMPT_TEMPLATE_PATH = get_prompt_path("disambiguate_by_text.yaml")
+logger = get_logger(__name__)
+
+
+def _llm_model_name(llm: "ChatOpenAI") -> str | None:
+    return getattr(llm, "model_name", None) or getattr(llm, "model", None) or config.llm.model
+
+
+def _candidate_trace_preview(candidates: list["ElementMark"]) -> list[dict[str, str | int]]:
+    return [
+        {
+            "overlay_mark_id": index + 1,
+            "mark_id": candidate.mark_id,
+            "text": candidate.text[:120],
+        }
+        for index, candidate in enumerate(candidates[:20])
+    ]
+
+
+def _extract_selected_index(message: dict[str, object] | None) -> int | None:
+    if not message:
+        return None
+    args = message.get("args") if isinstance(message.get("args"), dict) else {}
+    selected = args.get("selected_mark_id")
+    if selected is None:
+        items = args.get("items") or []
+        if items and isinstance(items[0], dict):
+            selected = items[0].get("mark_id")
+    if selected is None:
+        selected = args.get("mark_id")
+    try:
+        return int(selected)
+    except (TypeError, ValueError):
+        return None
+
+
+async def resolve_mark_ids_from_map(
+    *,
+    page: "Page",
+    llm: "ChatOpenAI",
+    snapshot: "SoMSnapshot",
+    mark_id_text_map: dict[str, str],
+    max_retries: int | None = None,
+    visual_cache: VisualDecisionCache | None = None,
+    page_state_signature: str = "",
+) -> list[int]:
+    """解析 LLM 返回的 mark_id_text_map（文本优先）
+
+    Returns:
+        去重后的最终 mark_id 列表
+    """
+    validator = MarkIdValidator()
+    resolved_mark_ids, results = await validator.validate_mark_id_text_map(
+        mark_id_text_map, snapshot, page=page
+    )
+
+    final_ids = list(resolved_mark_ids)
+
+    retries = max(
+        1,
+        int(
+            max_retries if max_retries is not None else config.url_collector.max_validation_retries
+        ),
+    )
+    allow_partial = len(mark_id_text_map) > 1  # 修改原因：批量选择时，允许少量未命中不阻断全局流程
+
+    for r in results:
+        if r.is_valid:
+            continue
+
+        if r.status in {"text_ambiguous", "text_prefix_ambiguous"} and r.candidate_mark_ids:
+            candidates = [m for m in snapshot.marks if m.mark_id in set(r.candidate_mark_ids)]
+            selected = await disambiguate_mark_id_by_text(
+                page=page,
+                llm=llm,
+                candidates=candidates,
+                target_text=r.llm_text,
+                max_retries=retries,
+                visual_cache=visual_cache,
+                page_state_signature=page_state_signature,
+            )
+            if selected is None:
+                if allow_partial:
+                    logger.warning(
+                        "[TextFirst] ⚠ 歧义重选失败，已跳过该条: text='%s'",
+                        r.llm_text[:60],
+                    )
+                    continue
+                raise ValueError(
+                    f"歧义重选失败: text='{r.llm_text}' candidates={r.candidate_mark_ids}"
+                )
+            final_ids.append(selected)
+            continue
+
+        if r.status == "text_not_found":
+            if allow_partial:
+                logger.warning("[TextFirst] ⚠ 未命中文本，已跳过该条: '%s'", r.llm_text[:60])
+                continue
+            raise ValueError(f"未在当前候选框中找到目标文本: '{r.llm_text}'")
+
+    # 去重保持顺序
+    seen = set()
+    deduped: list[int] = []
+    for mid in final_ids:
+        if mid not in seen:
+            deduped.append(mid)
+            seen.add(mid)
+
+    if not deduped:
+        # 修改原因：即使允许 partial，也不能返回空集合，否则下游无可执行目标
+        raise ValueError("未能从当前候选框中解析出任何可用的 mark_id（文本匹配全部失败）")
+
+    return deduped
+
+
+async def resolve_single_mark_id(
+    *,
+    page: "Page",
+    llm: "ChatOpenAI",
+    snapshot: "SoMSnapshot",
+    mark_id: int | None,
+    target_text: str,
+    max_retries: int | None = None,
+    visual_cache: VisualDecisionCache | None = None,
+    page_state_signature: str = "",
+) -> int:
+    """解析单个 mark_id（文本优先）
+
+    修改原因：Agent 的 click/type/extract 等动作通常是 (mark_id + target_text) 形式，
+    需要在执行前纠正 mark_id（或在歧义时重选），避免误点误输。
+    """
+    key = str(mark_id) if mark_id is not None else "-1"
+    resolved = await resolve_mark_ids_from_map(
+        page=page,
+        llm=llm,
+        snapshot=snapshot,
+        mark_id_text_map={key: target_text},
+        max_retries=max_retries,
+        visual_cache=visual_cache,
+        page_state_signature=page_state_signature,
+    )
+    if not resolved:
+        raise ValueError(f"无法解析目标文本对应的元素: '{target_text}'")
+    return resolved[0]
+
+
+async def disambiguate_mark_id_by_text(
+    *,
+    page: "Page",
+    llm: "ChatOpenAI",
+    candidates: list["ElementMark"],
+    target_text: str,
+    max_retries: int = 1,
+    visual_cache: VisualDecisionCache | None = None,
+    page_state_signature: str = "",
+) -> int | None:
+    """当同一文本命中多个候选元素时，截图让 LLM 重选（只给候选截图+新 mark）"""
+    if not candidates:
+        if visual_cache is not None:
+            visual_cache.put_reject(
+                page_state_signature=page_state_signature,
+                purpose="mark_text",
+                target_text=target_text,
+                reason="missing_dom",
+            )
+        return None
+
+    overlay_marks = [
+        {"mark_id": str(i + 1), "bbox": c.bbox.model_dump()}
+        for i, c in enumerate(candidates[:20])  # 防止候选过多影响可读性
+    ]
+    candidate_preview = _candidate_trace_preview(candidates)
+
+    if visual_cache is not None:
+        cached = visual_cache.get(
+            page_state_signature=page_state_signature,
+            purpose="mark_text",
+            target_text=target_text,
+        )
+        candidate_text = str(cached.get("candidate_text") or "").strip()
+        if candidate_text:
+            for candidate in candidates:
+                if str(candidate.text or "").strip() == candidate_text:
+                    logger.info("[TextFirst] cache_hit: purpose=mark_text target=%s", target_text[:60])
+                    return candidate.mark_id
+            logger.info("[TextFirst] cache_reject: purpose=mark_text reason=missing_dom target=%s", target_text[:60])
+
+    system_prompt = render_template(PROMPT_TEMPLATE_PATH, section="system_prompt")
+    user_message = render_template(
+        PROMPT_TEMPLATE_PATH,
+        section="user_message",
+        variables={
+            "target_text": target_text,
+            "candidate_count": str(len(overlay_marks)),
+        },
+    )
+
+    attempts = max(1, int(max_retries or 1))
+    for attempt_index in range(attempts):
+        _, screenshot_base64 = await capture_screenshot_with_custom_marks(
+            page, overlay_marks, hide_original_som=True
+        )
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": user_message},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_base64}"},
+                    },
+                ]
+            ),
+        ]
+
+        raw_response = ""
+        response_summary: dict[str, object] = {}
+        try:
+            response = await ainvoke_with_stream(llm, messages)
+            raw_response = extract_response_text_from_llm_payload(response)
+            response_summary = summarize_llm_payload(response)
+            message = parse_protocol_message(response)
+        except Exception as exc:
+            append_llm_trace(
+                component="text_first_disambiguate",
+                payload={
+                    "model": _llm_model_name(llm),
+                    "input": {
+                        "target_text": target_text,
+                        "attempt_index": attempt_index + 1,
+                        "max_retries": attempts,
+                        "candidate_count": len(candidate_preview),
+                        "candidates": candidate_preview,
+                        "system_prompt": system_prompt,
+                        "user_message": user_message,
+                        "screenshot_base64_len": len(screenshot_base64 or ""),
+                    },
+                    "output": {
+                        "raw_response": raw_response,
+                        "parsed_payload": None,
+                        "selected_overlay_mark_id": None,
+                        "resolved_mark_id": None,
+                    },
+                    "response_summary": response_summary,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                },
+            )
+            raise
+
+        selected_index = _extract_selected_index(message)
+        resolved_mark_id = None
+        if selected_index is not None and 1 <= selected_index <= len(overlay_marks):
+            resolved_mark_id = candidates[selected_index - 1].mark_id
+        append_llm_trace(
+            component="text_first_disambiguate",
+            payload={
+                "model": _llm_model_name(llm),
+                "input": {
+                    "target_text": target_text,
+                    "attempt_index": attempt_index + 1,
+                    "max_retries": attempts,
+                    "candidate_count": len(candidate_preview),
+                    "candidates": candidate_preview,
+                    "system_prompt": system_prompt,
+                    "user_message": user_message,
+                    "screenshot_base64_len": len(screenshot_base64 or ""),
+                },
+                "output": {
+                    "raw_response": raw_response,
+                    "parsed_payload": message,
+                    "selected_overlay_mark_id": selected_index,
+                    "resolved_mark_id": resolved_mark_id,
+                },
+                "response_summary": response_summary,
+            },
+        )
+        if not message:
+            continue
+        if message.get("action") != "select":
+            continue
+
+        if resolved_mark_id is not None:
+            if visual_cache is not None:
+                visual_cache.put_success(
+                    page_state_signature=page_state_signature,
+                    purpose="mark_text",
+                    target_text=target_text,
+                    candidate_text=str(candidates[selected_index - 1].text or "") if selected_index else "",
+                    confidence=1.0,
+                )
+            return resolved_mark_id
+
+    if visual_cache is not None:
+        visual_cache.put_reject(
+            page_state_signature=page_state_signature,
+            purpose="mark_text",
+            target_text=target_text,
+            reason="missing_dom",
+        )
+    return None

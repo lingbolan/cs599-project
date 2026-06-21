@@ -25,12 +25,24 @@ cs599-project/
 │   ├── CS599_大作业报告.pdf
 │   └── architecture.md
 ├── src/
+│   └── autospider-project/        # AutoSpider 项目代码与运行脚本
+│       ├── src/autospider/        # 核心 Agent 实现
+│       ├── tests/                 # 测试用例
+│       ├── start_bangumi_demo.cmd # Bangumi 小规模演示脚本
+│       └── start_autospider.cmd   # 交互式启动脚本
 ├── README.md
 ├── .gitignore
 └── LICENSE
 ```
 
 ## 环境搭建
+
+项目代码位于 `src/autospider-project/`。本地已验证的演示入口：
+
+```cmd
+cd /d D:\codex\code\cs599-project\src\autospider-project
+start_bangumi_demo.cmd
+```
 
 后续补充完整环境搭建步骤，包括 Python 版本、虚拟环境、依赖安装、API Key 环境变量配置、Playwright 浏览器安装和本地运行命令。
 

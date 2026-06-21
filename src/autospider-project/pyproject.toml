@@ -1,0 +1,205 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "autospider"
+version = "0.1.0"
+description = "A pure-vision browser agent using LangGraph and Set-of-Mark (SoM) prompting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "AutoSpider", email = "autospider@example.com" }]
+
+dependencies = [
+    "langgraph>=1.0.5",
+    "langchain>=1.2.0",
+    "langchain-openai>=1.1.6",
+    "playwright>=1.57.0",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.10.1",
+    "pillow>=12.1.0",
+    "rich>=14.2.0",
+    "typer>=0.21.0",
+    "python-dotenv>=1.2.1",
+    "loguru>=0.7.3",
+    "ddddocr>=1.5.6",
+    "opencv-python-headless>=4.12.0.88",
+    "playwright-stealth>=2.0.0",
+    "tenacity>=9.1.2",
+]
+
+[project.optional-dependencies]
+redis = [
+    "redis>=7.1.0",
+    "langgraph-checkpoint-redis>=0.3.6",
+]
+db = [
+    "alembic>=1.13.2",
+    "pandas>=2.3.3",
+    "sqlalchemy>=2.0.45",
+    "pymysql>=1.1.2",
+    "openpyxl>=3.1.5",
+]
+spider = [
+    "scrapy>=2.13.4",
+    "scrapy-playwright>=0.0.44",
+]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-mock>=3.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "import-linter>=2.0",
+    "syrupy>=4.0",
+    "jsonschema>=4.0",
+    "fakeredis>=2.20",
+    "pre-commit>=3.5",
+    "vulture>=2.10",
+    "deptry>=0.12",
+]
+all = [
+    "autospider[redis,db,spider,dev]",
+]
+
+[project.scripts]
+autospider = "autospider.interface.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/autospider"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/autospider"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+exclude = [
+    ".venv", ".git", "__pycache__", "build", "dist",
+    "src/autospider/prompts",
+    "src/autospider/legacy",
+    "src/output",
+    "tests/benchmark/mock_site",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+    "TID",
+    "TCH",
+    "PL",
+    "C90",
+    "N",
+    "RUF",
+]
+ignore = [
+    "E501",
+    "PLR0913",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-statements = 50
+max-branches = 12
+max-args = 8
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "S101", "E402"]
+"tests/**/__init__.py" = ["F401"]
+"src/autospider/platform/shared_kernel/**" = ["PLR0911"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["autospider"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
+ignore_missing_imports = true
+pretty = true
+exclude = ["^src/autospider/legacy/", "^src/output/"]
+
+# 核心领域层：严格模式
+[[tool.mypy.overrides]]
+module = [
+    "autospider.contexts.*.domain.*",
+    "autospider.platform.shared_kernel.*",
+]
+strict = true
+disallow_untyped_defs = true
+disallow_any_explicit = false
+
+# application 层：半严格
+[[tool.mypy.overrides]]
+module = [
+    "autospider.contexts.*.application.*",
+]
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+# infrastructure / composition / interface：渐进
+[[tool.mypy.overrides]]
+module = [
+    "autospider.contexts.*.infrastructure.*",
+    "autospider.composition.*",
+    "autospider.interface.*",
+]
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+# legacy：跳过（阶段 4 遗留，未物理删除）
+[[tool.mypy.overrides]]
+module = ["autospider.legacy", "autospider.legacy.*"]
+follow_imports = "skip"
+
+# 测试宽松
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+check_untyped_defs = false
+
+[tool.deptry]
+extend_exclude = [
+    "tests/",
+    "scripts/",
+    "src/autospider/prompts/",
+    "src/autospider/legacy/",
+]
+ignore = ["DEP002"]
+
+[tool.deptry.package_module_name_map]
+"langgraph-checkpoint-redis" = "langgraph_checkpoint_redis"
+"opencv-python-headless" = "cv2"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = ["tmp*"]
+markers = [
+    "smoke: fast developer smoke tests",
+    "benchmark: benchmark scenario and benchmark CLI tests",
+    "e2e: end-to-end graph tests",
+    "integration: integration tests requiring Redis/PG",
+]

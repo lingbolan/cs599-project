@@ -1,0 +1,378 @@
+"""子任务隔离执行器。
+
+每个 SubTaskWorker 为一个子任务提供独立的执行环境：
+- 独立输出目录
+- 复用现有 run_pipeline() 作为执行引擎
+- 统一走 Redis，并按子任务隔离队列命名空间
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from autospider.platform.config.runtime import config
+from autospider.platform.observability.logger import get_logger
+from autospider.contexts.collection.domain.fields import FieldDefinition
+from autospider.contexts.planning.domain import SubTask, SubTaskMode, format_execution_brief
+from ..graph.decision_context import build_decision_context
+from ..pipeline.helpers import build_execution_context
+from ..pipeline.subtask_runtime import restore_subtask, subtask_to_payload
+from ..pipeline.types import ExecutionRequest, PipelineMode, PipelineRunResult, SubtaskOutcomeType
+from autospider.contexts.planning.application.handlers import RuntimeExpansionService
+from .runtime_controls import resolve_concurrency_settings
+from .worker_fields import prepare_subtask_fields
+
+logger = get_logger(__name__)
+
+
+def _is_reusable_collection_config(config: dict[str, Any]) -> bool:
+    if not config:
+        return False
+    return bool(
+        str(config.get("profile_validation_status") or "").strip() == "validated"
+        and str(config.get("common_detail_xpath") or "").strip()
+    )
+
+
+def _runtime_result_payload(item: Any) -> dict[str, Any]:
+    if hasattr(item, "model_dump"):
+        return item.model_dump(mode="python")
+    return dict(item or {})
+
+
+def _resolve_runtime_replan_max_children(raw_value: object | None) -> int:
+    candidate = config.planner.runtime_subtasks_max_children if raw_value is None else raw_value
+    try:
+        resolved = int(candidate or 0)
+    except (TypeError, ValueError):
+        resolved = 0
+    return max(0, resolved)
+
+
+def _resolve_runtime_subtasks_use_main_model(raw_value: object | None) -> bool:
+    if raw_value is None:
+        return bool(config.planner.runtime_subtasks_use_main_model)
+    if isinstance(raw_value, bool):
+        return raw_value
+    return str(raw_value).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _resolve_outcome_type(result: PipelineRunResult) -> str:
+    if result.summary.outcome_state == "no_data":
+        return SubtaskOutcomeType.NO_DATA.value
+    if result.error:
+        return SubtaskOutcomeType.SYSTEM_FAILURE.value
+    if result.summary.success_count <= 0:
+        return SubtaskOutcomeType.BUSINESS_FAILURE.value
+    return SubtaskOutcomeType.SUCCESS.value
+
+
+class SubTaskWorker:
+    """隔离的子任务执行器。
+
+    每个 Worker 将子任务路由到独立的输出子目录，
+    并复用现有的 run_pipeline() 进行完整的 Producer-Explorer-Consumer 流程。
+    """
+
+    def __init__(
+        self,
+        subtask: SubTask,
+        fields: list[dict],
+        output_dir: str = "output",
+        headless: bool | None = None,
+        thread_id: str = "",
+        guard_intervention_mode: str = "blocking",
+        consumer_concurrency: int | None = None,
+        field_explore_count: int | None = None,
+        field_validate_count: int | None = None,
+        selected_skills: list[dict[str, str]] | None = None,
+        plan_knowledge: str = "",
+        task_plan_snapshot: dict | None = None,
+        plan_journal: list[dict] | None = None,
+        pipeline_mode: PipelineMode | None = None,
+        runtime_expansion_service_cls: type | None = None,
+        runtime_subtask_max_children: int | None = None,
+        runtime_subtasks_use_main_model: bool | None = None,
+        decision_context: dict | None = None,
+        world_snapshot: dict | None = None,
+        control_snapshot: dict | None = None,
+        failure_records: list[dict] | None = None,
+    ):
+        self.subtask = subtask
+        self.raw_fields = fields
+        self.output_dir = str(Path(output_dir) / f"subtask_{subtask.id}")
+        self.headless = headless
+        self.thread_id = thread_id
+        self.guard_intervention_mode = guard_intervention_mode
+        self.consumer_concurrency = consumer_concurrency
+        self.field_explore_count = field_explore_count
+        self.field_validate_count = field_validate_count
+        self.selected_skills = list(selected_skills or [])
+        self.plan_knowledge = str(plan_knowledge or "")
+        self.task_plan_snapshot = dict(task_plan_snapshot or {})
+        self.plan_journal = list(plan_journal or [])
+        self.pipeline_mode = pipeline_mode
+        self.runtime_subtask_max_children = runtime_subtask_max_children
+        self.runtime_subtasks_use_main_model = runtime_subtasks_use_main_model
+        self.decision_context = dict(decision_context or {})
+        self.world_snapshot = dict(world_snapshot or {})
+        self.control_snapshot = dict(control_snapshot or {})
+        self.failure_records = [dict(item) for item in list(failure_records or [])]
+        service_cls = runtime_expansion_service_cls or RuntimeExpansionService
+        self.runtime_expansion_service = service_cls()
+
+    def _prepare_fields(self) -> list[FieldDefinition]:
+        return prepare_subtask_fields(self.subtask, self.raw_fields)
+
+    def _resolved_concurrency(self):
+        return resolve_concurrency_settings(
+            {
+                "serial_mode": False,
+                "consumer_concurrency": self.consumer_concurrency or 1,
+                "global_browser_budget": None,
+            }
+        )
+
+    def _build_run_namespace(self) -> str:
+        """构建稳定且按子任务隔离的运行命名空间。"""
+        payload = {
+            "thread_id": str(self.thread_id or ""),
+            "subtask_id": str(self.subtask.id or ""),
+            "page_state_signature": str(self.subtask.page_state_signature or ""),
+            "variant_label": str(self.subtask.variant_label or ""),
+            "anchor_url": str(self.subtask.anchor_url or ""),
+            "list_url": str(self.subtask.list_url or ""),
+            "task_description": str(self.subtask.task_description or ""),
+            "execution_brief": self.subtask.execution_brief.model_dump(mode="python"),
+            "output_dir": str(self.output_dir or ""),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _resolve_decision_context(self, subtask: SubTask) -> dict:
+        if self.world_snapshot and self.control_snapshot:
+            return build_decision_context(
+                {
+                    "world": self._build_runtime_world_snapshot(),
+                    "control": dict(self.control_snapshot),
+                },
+                page_id=str(subtask.plan_node_id or ""),
+            )
+        return dict(self.decision_context or {})
+
+    def _build_runtime_world_snapshot(self) -> dict:
+        world = dict(self.world_snapshot or {})
+        runtime_failures = [dict(item) for item in list(self.failure_records or [])]
+        world["failure_records"] = runtime_failures
+        raw_world_model = world.get("world_model")
+        if isinstance(raw_world_model, dict):
+            world_model = dict(raw_world_model)
+            world_model["failure_records"] = runtime_failures
+            world["world_model"] = world_model
+        return world
+
+    def _resolve_previous_subtask_collection_config(self, subtask: SubTask) -> dict[str, Any]:
+        execution = dict(self.world_snapshot.get("execution") or {})
+        result_items = list(execution.get("subtask_results") or [])
+        current_subtask_id = str(subtask.id or "")
+        current_parent_node_id = str(subtask.parent_node_id or "")
+        if not current_parent_node_id:
+            logger.info(
+                "[Worker:%s] sibling_subtask_config_miss: reason=missing_parent_node_id",
+                current_subtask_id,
+            )
+            return {}
+        scanned = 0
+        for item in reversed(result_items):
+            scanned += 1
+            payload = _runtime_result_payload(item)
+            if str(payload.get("subtask_id") or "") == current_subtask_id:
+                continue
+            if str(payload.get("parent_node_id") or "") != current_parent_node_id:
+                continue
+            collection_config = dict(payload.get("collection_config") or {})
+            if not _is_reusable_collection_config(collection_config):
+                logger.info(
+                    "[Worker:%s] sibling_subtask_config_skip: source_subtask=%s, reason=not_validated, profile_validation_status=%s, common_detail_xpath=%s",
+                    current_subtask_id,
+                    str(payload.get("subtask_id") or "<unknown>"),
+                    str(collection_config.get("profile_validation_status") or "") or "<empty>",
+                    str(collection_config.get("common_detail_xpath") or "") or "<empty>",
+                )
+                continue
+            logger.info(
+                "[Worker:%s] reuse_sibling_subtask_config: source_subtask=%s, parent_node_id=%s, profile_key=%s, common_detail_xpath=%s",
+                current_subtask_id,
+                str(payload.get("subtask_id") or "<unknown>"),
+                current_parent_node_id,
+                str(collection_config.get("profile_key") or "") or "<empty>",
+                str(collection_config.get("common_detail_xpath") or "") or "<empty>",
+            )
+            return collection_config
+        logger.info(
+            "[Worker:%s] sibling_subtask_config_miss: reason=no_validated_sibling_config | parent_node_id=%s | scanned=%s | results=%s",
+            current_subtask_id,
+            current_parent_node_id,
+            scanned,
+            len(result_items),
+        )
+        return {}
+
+    def _resolve_initial_collection_config(self, subtask: SubTask) -> dict[str, Any]:
+        return self._resolve_previous_subtask_collection_config(subtask)
+
+    def _normalize_runtime_journal_entries(self, entries: tuple[dict[str, str], ...]) -> list[dict]:
+        created_at = datetime.now().isoformat(timespec="seconds")
+        normalized: list[dict] = []
+        for index, entry in enumerate(entries, start=1):
+            payload = dict(entry)
+            payload["entry_id"] = str(
+                payload.get("entry_id")
+                or f"runtime_{self.subtask.id}_{index}_{datetime.now().strftime('%H%M%S%f')}"
+            )
+            payload["created_at"] = str(payload.get("created_at") or created_at)
+            normalized.append(payload)
+        return normalized
+
+    async def _expand_runtime_subtask(self) -> dict:
+        expanded = await self.runtime_expansion_service.expand(
+            subtask=self.subtask,
+            output_dir=self.output_dir,
+            headless=self.headless,
+            thread_id=self.thread_id,
+            guard_intervention_mode=self.guard_intervention_mode,
+            global_browser_budget=self._resolved_concurrency().global_browser_budget,
+            max_children=_resolve_runtime_replan_max_children(self.runtime_subtask_max_children),
+            use_main_model=_resolve_runtime_subtasks_use_main_model(
+                self.runtime_subtasks_use_main_model
+            ),
+            decision_context=self._resolve_decision_context(self.subtask),
+            world_snapshot=dict(self.world_snapshot or {}),
+        )
+        journal_entries = self._normalize_runtime_journal_entries(expanded.journal_entries)
+        return {
+            "execution_state": expanded.execution_state,
+            "expand_request": (
+                {
+                    "parent_subtask_id": expanded.expand_request.parent_subtask_id,
+                    "spawned_subtasks": list(expanded.expand_request.spawned_subtasks),
+                    "journal_entries": journal_entries,
+                    "reason": expanded.expand_request.reason,
+                }
+                if expanded.expand_request is not None
+                else None
+            ),
+            "journal_entries": journal_entries,
+            "effective_subtask": expanded.effective_subtask,
+        }
+
+    async def execute(self) -> dict:
+        """执行子任务，返回 run_pipeline 的汇总结果。"""
+        # 延迟导入避免循环依赖
+        from .runner import run_pipeline
+
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        working_subtask = self.subtask
+        journal_entries: list[dict] = []
+
+        logger.info(
+            "[Worker:%s] start: name=%s | parent_node_id=%s | mode=%s | list=%s | target=%s | pages=%s",
+            self.subtask.id,
+            self.subtask.name,
+            str(self.subtask.parent_node_id or "") or "<root>",
+            self.subtask.mode.value,
+            self.subtask.list_url[:80],
+            self.subtask.target_url_count if self.subtask.target_url_count is not None else "<none>",
+            self.subtask.max_pages if self.subtask.max_pages is not None else "<none>",
+        )
+        if self.subtask.mode == SubTaskMode.EXPAND:
+            runtime_result = await self._expand_runtime_subtask()
+            journal_entries = list(runtime_result.get("journal_entries") or [])
+            working_subtask = restore_subtask(
+                runtime_result.get("effective_subtask") or self.subtask
+            )
+            if runtime_result.get("execution_state") == "expanded":
+                logger.info(
+                    "[Worker:%s] 运行时扩树完成，返回 ExpandRequest",
+                    self.subtask.id,
+                )
+                return {
+                    "execution_state": "expanded",
+                    "outcome_type": SubtaskOutcomeType.EXPANDED.value,
+                    "expand_request": runtime_result.get("expand_request"),
+                    "journal_entries": journal_entries,
+                    "effective_subtask": subtask_to_payload(working_subtask),
+                    "_effective_subtask": working_subtask,
+                    "items_file": "",
+                    "total_urls": 0,
+                    "success_count": 0,
+                }
+
+        concurrency = self._resolved_concurrency()
+        world_snapshot = dict(self.world_snapshot or {})
+        decision_context = self._resolve_decision_context(working_subtask)
+        initial_collection_config = self._resolve_initial_collection_config(working_subtask)
+        request = ExecutionRequest(
+            list_url=working_subtask.list_url,
+            task_description=working_subtask.task_description,
+            request=working_subtask.task_description,
+            fields=[field.model_dump(mode="python") for field in self._prepare_fields()],
+            execution_brief=working_subtask.execution_brief.model_dump(mode="python"),
+            output_dir=self.output_dir,
+            headless=self.headless,
+            field_explore_count=self.field_explore_count,
+            field_validate_count=self.field_validate_count,
+            consumer_concurrency=concurrency.consumer_concurrency,
+            max_pages=working_subtask.max_pages,
+            target_url_count=working_subtask.target_url_count,
+            pipeline_mode=self.pipeline_mode,
+            guard_intervention_mode=self.guard_intervention_mode,
+            guard_thread_id=self.thread_id,
+            selected_skills=list(self.selected_skills or []),
+            plan_knowledge=self.plan_knowledge,
+            task_plan_snapshot=self.task_plan_snapshot,
+            plan_journal=list(self.plan_journal or []),
+            initial_nav_steps=list(working_subtask.nav_steps or []),
+            initial_collection_config=initial_collection_config,
+            decision_context=decision_context,
+            world_snapshot=world_snapshot,
+            failure_records=[dict(item) for item in list(self.failure_records or [])],
+            anchor_url=working_subtask.anchor_url,
+            page_state_signature=working_subtask.page_state_signature,
+            variant_label=working_subtask.variant_label,
+            execution_id=self._build_run_namespace(),
+            global_browser_budget=concurrency.global_browser_budget,
+        )
+        context = build_execution_context(request, fields=self._prepare_fields())
+        logger.info(
+            "[Worker:%s] runtime_request: pipeline_mode=%s | execution_id=%s | initial_collection_config=%s",
+            self.subtask.id,
+            context.pipeline_mode.value,
+            context.execution_id,
+            "yes" if initial_collection_config else "no",
+        )
+        pipeline_result = await run_pipeline(context)
+        result = pipeline_result.to_payload()
+        result["outcome_type"] = _resolve_outcome_type(pipeline_result)
+        pipeline_result = PipelineRunResult.from_raw(result)
+
+        logger.info(
+            "[Worker:%s] done: urls=%d | success=%d | outcome=%s | profile=%s | xpath=%s",
+            self.subtask.id,
+            pipeline_result.summary.total_urls,
+            pipeline_result.summary.success_count,
+            result.get("outcome_type") or "<empty>",
+            str(dict(result.get("collection_config") or {}).get("profile_validation_status") or "") or "<empty>",
+            str(dict(result.get("collection_config") or {}).get("common_detail_xpath") or "") or "<empty>",
+        )
+        result["journal_entries"] = journal_entries
+        pipeline_result = PipelineRunResult.from_raw(result)
+        result["effective_subtask"] = subtask_to_payload(working_subtask)
+        result["_effective_subtask"] = working_subtask
+        result["_pipeline_result"] = pipeline_result
+        result["execution_brief_text"] = format_execution_brief(working_subtask.execution_brief)
+        return result
