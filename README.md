@@ -1,6 +1,6 @@
-# AutoSpider
+# AutoSpider: A Pure-Vision Browser Agent for Web Data Collection
 
-A pure-vision browser agent built on **LangGraph** and **Set-of-Mark (SoM)** prompting. Organised as a lightweight-DDD modular monolith with four Bounded Contexts, Redis as both queue and store, and a single `output/runs/<run_id>/` artifact layout.
+AutoSpider is a pure-vision browser agent built on **LangGraph** and **Set-of-Mark (SoM)** prompting. Organised as a lightweight-DDD modular monolith with four Bounded Contexts, Redis as both queue and store, and a single `output/runs/<run_id>/` artifact layout.
 
 > Status: contexts refactor landed on the current bounded-context layout; architecture guardrails are enforced by repository config and contract tests.
 
