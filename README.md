@@ -23,7 +23,7 @@
 cs599-project/
 ├── docs/
 │   ├── architecture.md              # 系统架构说明
-│   └── CS599_大作业报告.pdf          # 最终报告，后续补充
+│   └── CS599_大作业报告.pdf          # 最终报告 PDF
 ├── src/
 │   └── autospider-project/
 │       ├── src/autospider/
@@ -90,9 +90,9 @@ copy .env.example .env
 编辑 `.env`，配置 OpenAI 兼容 API：
 
 ```env
-BAILIAN_API_KEY=your-api-key-here
-BAILIAN_API_BASE=https://your-api-provider.example/v1
-BAILIAN_MODEL=your-model-name
+AIPING_API_KEY=your-api-key-here
+AIPING_API_BASE=https://your-api-provider.example/v1
+AIPING_MODEL=your-model-name
 ```
 
 不要把 `.env` 提交到 GitHub。仓库 `.gitignore` 已忽略 `.env`、运行输出、虚拟环境和浏览器缓存。
@@ -229,9 +229,9 @@ Output Artifacts
 
 - [x] Proposal
 - [x] MVP
-- [ ] Final
+- [x] Final
 
-当前项目主体、运行脚本和 Demo 已完成。后续主要补充课程报告、Specs 文档、测试评估截图和最终 PDF。
+当前项目主体、运行脚本、Demo、架构文档和最终报告 PDF 已完成。
 
 ## 许可证
 
